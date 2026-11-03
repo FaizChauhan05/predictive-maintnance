@@ -7,6 +7,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import shap
 import streamlit as st
+import torch
+import torch.nn as nn
 from xgboost import XGBRegressor
 from dotenv import load_dotenv
 
@@ -15,6 +17,7 @@ from llm_report import generate_report, generate_classification_report
 
 load_dotenv()
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 
 st.set_page_config(
     page_title="Predictive Maintenance AI Platform",
@@ -32,6 +35,12 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
+
+COLS = ["unit", "cycle", "op1", "op2", "op3"] + [f"s{i}" for i in range(1, 22)]
+USEFUL = [f"s{i}" for i in [2, 3, 4, 7, 8, 9, 11, 12, 13, 14, 15, 17, 20, 21]]
+WINDOW_XGB = 10
+WINDOW_LSTM = 30
+BASELINE = 63.0
 
 TURBOFAN_SENSOR_NAMES = {
     "s2": "LPC Outlet Temp",
@@ -124,6 +133,124 @@ def plot_horizontal_shap(features, values, xlabel, title):
     return fig
 
 
+# -----------------------------------------------------------------------------
+# PyTorch LSTM Architecture & Model Loader
+# -----------------------------------------------------------------------------
+class RULNet(nn.Module):
+    def __init__(self, n_features=len(USEFUL)):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=n_features,
+            hidden_size=64,
+            num_layers=2,
+            batch_first=True,
+            dropout=0.2
+        )
+        self.head = nn.Sequential(
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        last_timestep = out[:, -1, :]
+        return self.head(last_timestep).squeeze(-1)
+
+
+@st.cache_resource
+def load_lstm_artifacts():
+    try:
+        model = RULNet(n_features=len(USEFUL))
+        weights_path = MODELS_DIR / "lstm.pt"
+        if not weights_path.exists():
+            return None, None, None
+        model.load_state_dict(torch.load(weights_path, map_location="cpu"))
+        model.eval()
+
+        mu = np.load(MODELS_DIR / "scaler_mu.npy")
+        sd = np.load(MODELS_DIR / "scaler_sd.npy")
+        return model, mu, sd
+    except Exception:
+        return None, None, None
+
+
+# -----------------------------------------------------------------------------
+# Turbofan Data & XGBoost Training Helpers
+# -----------------------------------------------------------------------------
+@st.cache_data
+def load_data():
+    train = pd.read_csv(DATA_DIR / "train_FD001.txt", sep=r"\s+", header=None, names=COLS)
+    max_cycle = train.groupby("unit")["cycle"].transform("max")
+    train["RUL"] = (max_cycle - train["cycle"]).clip(upper=125)
+    test = pd.read_csv(DATA_DIR / "test_FD001.txt", sep=r"\s+", header=None, names=COLS)
+    rul_true = pd.read_csv(DATA_DIR / "RUL_FD001.txt", sep=r"\s+", header=None, names=["RUL"])
+    return train, test, rul_true
+
+
+def features_rowwise(df, window=WINDOW_XGB):
+    rows = []
+    for unit, g in df.groupby("unit"):
+        g = g.sort_values("cycle").reset_index(drop=True)
+        for i in range(len(g)):
+            if i < window - 1:
+                continue
+            tail = g.iloc[i - window + 1 : i + 1]
+            row = {"unit": unit, "cycle": g.loc[i, "cycle"]}
+            if "RUL" in g.columns:
+                row["RUL"] = g.loc[i, "RUL"]
+            for c in USEFUL:
+                vals = tail[c].values
+                row[f"{c}_std"] = vals.std()
+                row[f"{c}_delta"] = vals[-1] - vals[0]
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+@st.cache_resource
+def train_model():
+    train, _, _ = load_data()
+    ftr = features_rowwise(train)
+    low = ftr[ftr["RUL"] <= 80]
+    high = ftr[ftr["RUL"] > 80].sample(frac=0.3, random_state=42)
+    balanced = pd.concat([low, high]).sample(frac=1.0, random_state=42).reset_index(drop=True)
+    X = balanced.drop(columns=["unit", "cycle", "RUL"])
+    y = balanced["RUL"].values
+    model = XGBRegressor(
+        n_estimators=300, max_depth=4, learning_rate=0.03,
+        subsample=0.7, colsample_bytree=0.7, reg_lambda=2.0,
+        random_state=42,
+    )
+    model.fit(X, y)
+    return model, shap.TreeExplainer(model)
+
+
+def features_for_engine(test_df, engine_id):
+    g = test_df[test_df["unit"] == engine_id].sort_values("cycle").reset_index(drop=True)
+    if len(g) < WINDOW_XGB:
+        return None, None
+    tail = g.tail(WINDOW_XGB)
+    row = {}
+    for c in USEFUL:
+        vals = tail[c].values
+        row[f"{c}_std"] = vals.std()
+        row[f"{c}_delta"] = vals[-1] - vals[0]
+    return pd.DataFrame([row]), int(g["cycle"].iloc[-1])
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def cached_report(engine_id, predicted_rul, baseline, top_features_tuple):
+    return generate_report(
+        engine_id=engine_id,
+        predicted_rul=predicted_rul,
+        baseline=baseline,
+        top_features=list(top_features_tuple),
+    )
+
+
+# -----------------------------------------------------------------------------
+# Sidebar Overview
+# -----------------------------------------------------------------------------
 with st.sidebar:
     st.header("Project Overview")
     st.markdown("""
@@ -139,7 +266,11 @@ with st.sidebar:
        - Extracts 15 statistical and frequency features per window.
        - Uses an **XGBoost Classifier** trained on the CWRU bearing dataset.
     
-    3. **AI Maintenance Interpretation**
+    3. **LSTM vs XGBoost RUL Comparison**
+       - Head-to-head evaluation across all 100 FD001 test engines.
+       - Compares error metrics (RMSE, MAE), per-engine accuracy, and CSV export.
+
+    4. **AI Maintenance Interpretation**
        - Synthesizes model outputs and SHAP features into an advisory report using Gemini.
     """)
     st.divider()
@@ -148,80 +279,16 @@ with st.sidebar:
 st.title("🛠️ Predictive Maintenance AI Platform")
 st.markdown("Monitor equipment condition, understand key drivers, and review AI maintenance recommendations.")
 
-tab_turbofan, tab_bearing = st.tabs(["✈️ Turbofan Engine Module", "⚙️ Bearing Vibration Module"])
+tab_turbofan, tab_bearing, tab_comparison = st.tabs([
+    "✈️ Turbofan Engine Module",
+    "⚙️ Bearing Vibration Module",
+    "📊 LSTM vs XGBoost RUL Comparison"
+])
 
-# --- Turbofan Engine Module ---
+# =============================================================================
+# TAB 1: TURBOFAN ENGINE MODULE
+# =============================================================================
 with tab_turbofan:
-    COLS = ["unit", "cycle", "op1", "op2", "op3"] + [f"s{i}" for i in range(1, 22)]
-    USEFUL = [f"s{i}" for i in [2, 3, 4, 7, 8, 9, 11, 12, 13, 14, 15, 17, 20, 21]]
-    WINDOW = 10
-    BASELINE = 63.0
-
-    @st.cache_data
-    def load_data():
-        train = pd.read_csv(DATA_DIR / "train_FD001.txt", sep=r"\s+", header=None, names=COLS)
-        max_cycle = train.groupby("unit")["cycle"].transform("max")
-        train["RUL"] = (max_cycle - train["cycle"]).clip(upper=125)
-        test = pd.read_csv(DATA_DIR / "test_FD001.txt", sep=r"\s+", header=None, names=COLS)
-        rul_true = pd.read_csv(DATA_DIR / "RUL_FD001.txt", sep=r"\s+", header=None, names=["RUL"])
-        return train, test, rul_true
-
-    def features_rowwise(df, window=WINDOW):
-        rows = []
-        for unit, g in df.groupby("unit"):
-            g = g.sort_values("cycle").reset_index(drop=True)
-            for i in range(len(g)):
-                if i < window - 1:
-                    continue
-                tail = g.iloc[i - window + 1 : i + 1]
-                row = {"unit": unit, "cycle": g.loc[i, "cycle"]}
-                if "RUL" in g.columns:
-                    row["RUL"] = g.loc[i, "RUL"]
-                for c in USEFUL:
-                    vals = tail[c].values
-                    row[f"{c}_std"] = vals.std()
-                    row[f"{c}_delta"] = vals[-1] - vals[0]
-                rows.append(row)
-        return pd.DataFrame(rows)
-
-    @st.cache_resource
-    def train_model():
-        train, _, _ = load_data()
-        ftr = features_rowwise(train)
-        low = ftr[ftr["RUL"] <= 80]
-        high = ftr[ftr["RUL"] > 80].sample(frac=0.3, random_state=42)
-        balanced = pd.concat([low, high]).sample(frac=1.0, random_state=42).reset_index(drop=True)
-        X = balanced.drop(columns=["unit", "cycle", "RUL"])
-        y = balanced["RUL"].values
-        model = XGBRegressor(
-            n_estimators=300, max_depth=4, learning_rate=0.03,
-            subsample=0.7, colsample_bytree=0.7, reg_lambda=2.0,
-            random_state=42,
-        )
-        model.fit(X, y)
-        return model, shap.TreeExplainer(model)
-
-    def features_for_engine(test_df, engine_id):
-        g = test_df[test_df["unit"] == engine_id].sort_values("cycle").reset_index(drop=True)
-        if len(g) < WINDOW:
-            return None, None
-        tail = g.tail(WINDOW)
-        row = {}
-        for c in USEFUL:
-            vals = tail[c].values
-            row[f"{c}_std"] = vals.std()
-            row[f"{c}_delta"] = vals[-1] - vals[0]
-        return pd.DataFrame([row]), int(g["cycle"].iloc[-1])
-
-    @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
-    def cached_report(engine_id, predicted_rul, baseline, top_features_tuple):
-        return generate_report(
-            engine_id=engine_id,
-            predicted_rul=predicted_rul,
-            baseline=baseline,
-            top_features=list(top_features_tuple),
-        )
-
     col_sel, col_btn = st.columns([3, 1])
     with col_sel:
         engine_id = st.selectbox(
@@ -369,7 +436,9 @@ with tab_turbofan:
         st.info(f"💡 **Recommended Next Step:** {recommendation}")
         st.caption("⚠️ Advisory notice: This interpretation is synthesized by Gemini from model outputs and is intended for decision support, not automatic control.")
 
-# --- Bearing Vibration Module ---
+# =============================================================================
+# TAB 2: BEARING VIBRATION MODULE
+# =============================================================================
 with tab_bearing:
     BEARING_FILES = {
         "Normal Baseline (Healthy)": "1797_Normal.npz",
@@ -568,6 +637,223 @@ with tab_bearing:
         st.info(f"💡 **Recommended Next Step:** {rec_b}")
         st.caption("⚠️ Advisory notice: This interpretation is synthesized by Gemini from model outputs and is intended for decision support, not automatic control.")
 
+# =============================================================================
+# TAB 3: LSTM VS XGBOOST RUL COMPARISON
+# =============================================================================
+with tab_comparison:
+    st.subheader("LSTM vs XGBoost RUL Comparison")
+    st.markdown(
+        "Head-to-head comparison between **Deep Learning (LSTM)** and **Gradient Boosted Trees (XGBoost)** "
+        "across all 100 test engines in the NASA C-MAPSS FD001 dataset."
+    )
+
+    lstm_model, lstm_mu, lstm_sd = load_lstm_artifacts()
+    xgb_model, _ = train_model()
+    _, test_df, rul_true_df = load_data()
+
+    if lstm_model is None or lstm_mu is None or lstm_sd is None:
+        st.error(
+            "⚠️ LSTM model artifacts (`models/lstm.pt`, `models/scaler_mu.npy`, `models/scaler_sd.npy`) "
+            "were not found. Please run `python code/main2.py` to train and save the LSTM model."
+        )
+    else:
+        # 1. XGBoost inference on all 100 test engines
+        xgb_test_rows = []
+        engine_ids = []
+        for unit, g in test_df.groupby("unit"):
+            g = g.sort_values("cycle").reset_index(drop=True)
+            tail = g.tail(WINDOW_XGB)
+            row = {}
+            for c in USEFUL:
+                v = tail[c].values
+                row[f"{c}_std"] = v.std()
+                row[f"{c}_delta"] = v[-1] - v[0]
+            xgb_test_rows.append(row)
+            engine_ids.append(int(unit))
+
+        X_xgb_test = pd.DataFrame(xgb_test_rows)
+        xgb_all_preds = np.clip(xgb_model.predict(X_xgb_test), 0, 125)
+
+        # 2. LSTM inference on all 100 test engines
+        test_norm = test_df.copy()
+        test_norm[USEFUL] = (test_norm[USEFUL] - lstm_mu) / lstm_sd
+
+        lstm_test_windows = []
+        for unit, g in test_norm.groupby("unit"):
+            g = g.sort_values("cycle").reset_index(drop=True)
+            vals = g[USEFUL].values
+            if len(g) >= WINDOW_LSTM:
+                lstm_test_windows.append(vals[-WINDOW_LSTM:])
+            else:
+                pad = np.repeat(vals[:1], WINDOW_LSTM - len(g), axis=0)
+                lstm_test_windows.append(np.vstack([pad, vals]))
+
+        X_lstm_tensor = torch.from_numpy(np.array(lstm_test_windows, dtype=np.float32))
+        with torch.no_grad():
+            lstm_all_preds = np.clip(lstm_model(X_lstm_tensor).numpy(), 0, 125)
+
+        # 3. Ground truth matching & error metrics
+        y_true_all = rul_true_df["RUL"].values.astype(float)
+
+        lstm_abs_errors = np.abs(lstm_all_preds - y_true_all)
+        xgb_abs_errors = np.abs(xgb_all_preds - y_true_all)
+
+        better_model_col = []
+        for l_err, x_err in zip(lstm_abs_errors, xgb_abs_errors):
+            if l_err < x_err:
+                better_model_col.append("LSTM")
+            elif x_err < l_err:
+                better_model_col.append("XGBoost")
+            else:
+                better_model_col.append("Tie")
+
+        comparison_df = pd.DataFrame({
+            "Engine ID": engine_ids,
+            "Actual RUL": y_true_all.astype(int),
+            "LSTM Predicted RUL": np.round(lstm_all_preds, 1),
+            "XGBoost Predicted RUL": np.round(xgb_all_preds, 1),
+            "LSTM Absolute Error": np.round(lstm_abs_errors, 1),
+            "XGBoost Absolute Error": np.round(xgb_abs_errors, 1),
+            "Better Model": better_model_col,
+        })
+
+        lstm_rmse = float(np.sqrt(np.mean((lstm_all_preds - y_true_all) ** 2)))
+        lstm_mae = float(np.mean(lstm_abs_errors))
+        xgb_rmse = float(np.sqrt(np.mean((xgb_all_preds - y_true_all) ** 2)))
+        xgb_mae = float(np.mean(xgb_abs_errors))
+
+        lstm_wins = int((comparison_df["Better Model"] == "LSTM").sum())
+        xgb_wins = int((comparison_df["Better Model"] == "XGBoost").sum())
+        ties = int((comparison_df["Better Model"] == "Tie").sum())
+
+        # Metric cards
+        st.divider()
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        with mc1:
+            st.metric(
+                label="LSTM RMSE",
+                value=f"{lstm_rmse:.2f} cycles",
+                delta="Lower Error" if lstm_rmse < xgb_rmse else None,
+                help="Root Mean Squared Error across all 100 test engines."
+            )
+        with mc2:
+            st.metric(
+                label="XGBoost RMSE",
+                value=f"{xgb_rmse:.2f} cycles",
+                delta="Lower Error" if xgb_rmse < lstm_rmse else None,
+                help="Root Mean Squared Error across all 100 test engines."
+            )
+        with mc3:
+            st.metric(
+                label="LSTM MAE",
+                value=f"{lstm_mae:.2f} cycles",
+                delta="Lower Error" if lstm_mae < xgb_mae else None,
+                help="Mean Absolute Error across all 100 test engines."
+            )
+        with mc4:
+            st.metric(
+                label="XGBoost MAE",
+                value=f"{xgb_mae:.2f} cycles",
+                delta="Lower Error" if xgb_mae < lstm_mae else None,
+                help="Mean Absolute Error across all 100 test engines."
+            )
+
+        if lstm_rmse < xgb_rmse:
+            st.info(
+                f"📊 **Summary:** **LSTM** achieved lower overall error (RMSE: **{lstm_rmse:.2f}** vs **{xgb_rmse:.2f}** cycles) "
+                f"and performed better on **{lstm_wins}** engines, while **XGBoost** performed better on **{xgb_wins}** engines ({ties} ties)."
+            )
+        elif xgb_rmse < lstm_rmse:
+            st.info(
+                f"📊 **Summary:** **XGBoost** achieved lower overall error (RMSE: **{xgb_rmse:.2f}** vs **{lstm_rmse:.2f}** cycles) "
+                f"and performed better on **{xgb_wins}** engines, while **LSTM** performed better on **{lstm_wins}** engines ({ties} ties)."
+            )
+        else:
+            st.info(f"📊 **Summary:** Both models tied with identical RMSE of **{lstm_rmse:.2f}** cycles.")
+
+        st.divider()
+
+        # Visualizations: 2 columns
+        c_vis1, c_vis2 = st.columns([1, 2])
+
+        with c_vis1:
+            st.subheader("Overall Error Metrics")
+            fig_ov, ax_ov = plt.subplots(figsize=(5, 3.5), facecolor="#141419")
+            ax_ov.set_facecolor("#141419")
+
+            bar_x = np.arange(2)
+            bar_w = 0.35
+
+            r1 = ax_ov.bar(bar_x - bar_w/2, [lstm_rmse, lstm_mae], width=bar_w, label="LSTM", color="#10b981")
+            r2 = ax_ov.bar(bar_x + bar_w/2, [xgb_rmse, xgb_mae], width=bar_w, label="XGBoost", color="#0284c7")
+
+            ax_ov.set_ylabel("Error (Cycles)", color="#94a3b8", fontsize=9.5)
+            ax_ov.set_title("RMSE & MAE (Lower is Better)", color="#f8fafc", fontsize=11, fontweight="bold", pad=10)
+            ax_ov.set_xticks(bar_x)
+            ax_ov.set_xticklabels(["RMSE", "MAE"], color="#e2e8f0", fontsize=10)
+            ax_ov.tick_params(axis="y", colors="#94a3b8", labelsize=9)
+
+            for spine in ax_ov.spines.values():
+                spine.set_visible(False)
+            ax_ov.grid(axis="y", color="#27273a", linestyle=":", linewidth=0.8)
+            ax_ov.legend(facecolor="#1e1e24", edgecolor="#334155", labelcolor="#e2e8f0")
+
+            for r in r1:
+                h = r.get_height()
+                ax_ov.text(r.get_x() + r.get_width()/2., h + 0.5, f"{h:.1f}", ha="center", va="bottom", color="#e2e8f0", fontsize=9, fontweight="bold")
+            for r in r2:
+                h = r.get_height()
+                ax_ov.text(r.get_x() + r.get_width()/2., h + 0.5, ha="center", va="bottom", color="#e2e8f0", fontsize=9, fontweight="bold")
+
+            fig_ov.tight_layout()
+            st.pyplot(fig_ov, use_container_width=True)
+
+        with c_vis2:
+            st.subheader("Engine-wise Absolute Error")
+            eng_range = st.slider("Select Engine ID Range to Display:", 1, 100, (1, 50))
+            start_eng, end_eng = eng_range
+
+            subset_df = comparison_df[(comparison_df["Engine ID"] >= start_eng) & (comparison_df["Engine ID"] <= end_eng)]
+
+            fig_bar, ax_bar = plt.subplots(figsize=(10, 3.8), facecolor="#141419")
+            ax_bar.set_facecolor("#141419")
+
+            idx_pos = np.arange(len(subset_df))
+            bw = 0.4
+
+            ax_bar.bar(idx_pos - bw/2, subset_df["LSTM Absolute Error"], width=bw, label="LSTM Error", color="#10b981", alpha=0.9)
+            ax_bar.bar(idx_pos + bw/2, subset_df["XGBoost Absolute Error"], width=bw, label="XGBoost Error", color="#0284c7", alpha=0.9)
+
+            ax_bar.set_xlabel("Engine ID", color="#94a3b8", fontsize=9.5)
+            ax_bar.set_ylabel("Absolute Error (Cycles)", color="#94a3b8", fontsize=9.5)
+            ax_bar.set_title(f"Absolute Error: Engines {start_eng} to {end_eng}", color="#f8fafc", fontsize=11, fontweight="bold", pad=10)
+            ax_bar.set_xticks(idx_pos)
+            ax_bar.set_xticklabels(subset_df["Engine ID"], color="#e2e8f0", fontsize=8, rotation=45 if len(subset_df) > 25 else 0)
+            ax_bar.tick_params(axis="y", colors="#94a3b8", labelsize=8.5)
+
+            for spine in ax_bar.spines.values():
+                spine.set_visible(False)
+            ax_bar.grid(axis="y", color="#27273a", linestyle=":", linewidth=0.8)
+            ax_bar.legend(facecolor="#1e1e24", edgecolor="#334155", labelcolor="#e2e8f0")
+
+            fig_bar.tight_layout()
+            st.pyplot(fig_bar, use_container_width=True)
+
+        st.divider()
+
+        # Table & CSV Download
+        st.subheader("Complete Test Fleet Comparison Table (100 Engines)")
+        st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+
+        csv_bytes = comparison_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="📥 Download Comparison Table (CSV)",
+            data=csv_bytes,
+            file_name="rul_model_comparison_fd001.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+
 st.divider()
 now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-st.caption(f"Predictive Maintenance AI Platform | Analyzed at {now_str} | Models: XGBoost Regressor & Classifier | XAI: TreeSHAP")
+st.caption(f"Predictive Maintenance AI Platform | Analyzed at {now_str} | Models: XGBoost Regressor & Classifier, PyTorch LSTM | XAI: TreeSHAP")

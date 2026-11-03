@@ -803,7 +803,7 @@ with tab_comparison:
                 ax_ov.text(r.get_x() + r.get_width()/2., h + 0.5, f"{h:.1f}", ha="center", va="bottom", color="#e2e8f0", fontsize=9, fontweight="bold")
             for r in r2:
                 h = r.get_height()
-                ax_ov.text(r.get_x() + r.get_width()/2., h + 0.5, ha="center", va="bottom", color="#e2e8f0", fontsize=9, fontweight="bold")
+                ax_ov.text(r.get_x() + r.get_width()/2., h + 0.5, f"{h:.1f}", ha="center", va="bottom", color="#e2e8f0", fontsize=9, fontweight="bold")
 
             fig_ov.tight_layout()
             st.pyplot(fig_ov, use_container_width=True)

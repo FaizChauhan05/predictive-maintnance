@@ -27,7 +27,7 @@ train = load("train_FD001.txt", labeled=True)
 test  = load("test_FD001.txt",  labeled=False)
 yte   = pd.read_csv("RUL_FD001.txt", sep=r"\s+", header=None).values.ravel()
 
-# ---------- NORMALIZE ----------
+#NORMALIZE ----------
 # fit scaler on training sensor values only
 mu = train[USEFUL].mean().values
 sd = train[USEFUL].std().values + 1e-8
@@ -40,7 +40,7 @@ def norm(df):
 train = norm(train)
 test  = norm(test)
 
-# ---------- SEQUENCES ----------
+#SEQUENCES
 def make_sequences(df, labeled):
     X, y = [], []
     for unit, g in df.groupby("unit"):

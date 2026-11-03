@@ -20,41 +20,34 @@ st.set_page_config(page_title="Predictive Maintenance AI", layout="wide")
 with st.sidebar:
     st.markdown("### About this dashboard")
     st.markdown("""
-**What it does:**
-Predictive maintenance platform with two machine modules sharing one
-explainability and AI-report pipeline. Picks a unit from a test set,
-estimates its condition, explains which sensor readings drove that
-estimate, and asks an AI to write a short maintenance note in plain
-English.
+This platform analyzes two types of industrial machines and estimates
+their current health using sensor data and machine learning.
 
-**Turbofan (C-MAPSS FD001)**
-- **Predicted RUL** — the model's best guess of how many cycles the
-  engine has left. Higher is healthier.
-- **Population Baseline** — the average predicted RUL across the
-  training fleet (63 cycles).
-- **True RUL (Answer Key)** — ground truth from the dataset, shown
-  for validation only. The model never sees it.
+**Turbofan Engine Module**
+- **Estimated Remaining Life** — How many operating cycles the engine
+  likely has left before maintenance is needed. Higher is healthier.
+- **Fleet Median** — A reference value representing the middle
+  remaining life across the benchmark engine fleet.
+- **Actual Remaining Life (Benchmark)** — The reference answer from
+  the test dataset, used for model evaluation. The model never sees
+  this value during prediction.
 
-**Bearing (CWRU)**
-- Vibration signal is windowed; 15 time + frequency domain features
-  are extracted per window.
-- XGBoost classifier predicts one of: Normal / Inner Race / Ball /
-  Outer Race.
-- **Confidence** = average predicted probability across all windows.
+**Bearing Vibration Module**
+- Analyzes vibration signals to detect bearing faults.
+- Classifies each bearing as **Normal**, **Inner Race Fault**,
+  **Ball Fault**, or **Outer Race Fault**.
+- **Model Confidence** — How consistently the model identified
+  the condition across all signal segments.
 
-**The chart on the right — "Why this prediction?"**
-Every reading gets scored by how much it pushed the prediction up or
-down:
-- **Blue bars (right)** = pushes toward *more life* / *current class*.
-- **Pink bars (left)** = pushes toward *less life* / *other classes*.
+**Feature Contribution Charts**
+Each sensor reading is scored by how much it influenced the result:
+- **Blue bars** → Pushed toward a healthier estimate or the detected condition.
+- **Pink bars** → Pushed toward a shorter life estimate or another condition.
 
-**The AI Maintenance Report**
-Gemini reads the prediction and top SHAP drivers, then writes a short
-structured note. It never sees raw sensor data.
-
-**What's not in here**
-- No live sensor feed — historical datasets only.
-- No real-time alerts — predictions made on demand.
+**Maintenance Interpretation**
+An AI reads the prediction and key contributing factors, then writes
+a short advisory note in plain English. It is not a substitute for
+professional engineering judgment.
 """)
 
 # ---------- THEME / CSS ----------
@@ -122,6 +115,8 @@ h1, h2, h3 { font-family: 'Geist', sans-serif; letter-spacing: -0.02em; }
 }
 .pm-badge.green { background: rgba(78,222,163,0.12); color: #4edea3; }
 .pm-badge.blue  { background: rgba(137,206,255,0.12); color: #89ceff; }
+.pm-badge.amber { background: rgba(255,185,95,0.12); color: #ffb95f; }
+.pm-badge.red   { background: rgba(255,180,171,0.12); color: #ffb4ab; }
 .pm-health {
     display: inline-flex;
     align-items: center;
@@ -200,6 +195,22 @@ h1, h2, h3 { font-family: 'Geist', sans-serif; letter-spacing: -0.02em; }
     border-radius: 8px;
     padding: 12px 16px;
 }
+.pm-card-explain {
+    font-size: 12.5px;
+    color: #88929b;
+    line-height: 1.6;
+    margin-top: 8px;
+}
+.pm-section-label {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: #88929b;
+    margin-bottom: 8px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid #2a2a2c;
+}
 
 /* Tabs (Streamlit's st.tabs) restyled to look like the mockup's top bar */
 .stTabs [data-baseweb="tab-list"] {
@@ -227,12 +238,50 @@ h1, h2, h3 { font-family: 'Geist', sans-serif; letter-spacing: -0.02em; }
 """, unsafe_allow_html=True)
 
 
+# ---------- HELPER: Readable turbofan feature names ----------
+def _readable_feature_name(raw_name, sensor_labels):
+    """Convert raw feature name like 's11_delta' to a human-readable label."""
+    parts = raw_name.split("_", 1)
+    sensor_code = parts[0]
+    suffix = parts[1] if len(parts) > 1 else ""
+    description = sensor_labels.get(sensor_code, sensor_code)
+    if suffix == "delta":
+        suffix_label = "Change"
+    elif suffix == "std":
+        suffix_label = "Variability"
+    else:
+        suffix_label = suffix
+    return f"{description} \u00b7 {suffix_label}  [{raw_name}]"
+
+
+# ---------- BEARING FEATURE LABELS ----------
+BEARING_FEATURE_LABELS = {
+    "mean": "Signal Average",
+    "std": "Signal Variability",
+    "rms": "Signal Intensity (RMS)",
+    "peak": "Maximum Vibration Peak",
+    "ptp": "Peak-to-Peak Range",
+    "kurtosis": "Sharpness of Vibration Spikes",
+    "skew": "Vibration Asymmetry",
+    "crest": "Crest Factor",
+    "shape": "Shape Factor",
+    "impulse": "Impulse Factor",
+    "band0_energy": "Low Freq. Energy (0\u2013500 Hz)",
+    "band1_energy": "Mid-Low Freq. Energy (500\u20131500 Hz)",
+    "band2_energy": "Mid Freq. Energy (1500\u20133000 Hz)",
+    "band3_energy": "Mid-High Freq. Energy (3000\u20134500 Hz)",
+    "band4_energy": "High Freq. Energy (4500\u20136000 Hz)",
+    "spec_centroid": "Spectral Center of Mass",
+    "spec_spread": "Spectral Spread",
+}
+
+
 # ---------- TABS ----------
-tab_turbofan, tab_bearing = st.tabs(["✈  Turbofan (C-MAPSS)", "⚙  Bearing (CWRU)"])
+tab_turbofan, tab_bearing = st.tabs(["\u2708  Turbofan Engine", "\u2699  Bearing Vibration"])
 
 
 # ===========================================================================
-# TAB 1 — TURBOFAN (identical to existing, unchanged)
+# TAB 1 \u2014 TURBOFAN
 # ===========================================================================
 with tab_turbofan:
     COLS = ["unit", "cycle", "op1", "op2", "op3"] + [f"s{i}" for i in range(1, 22)]
@@ -241,20 +290,20 @@ with tab_turbofan:
     BASELINE = 63.0
 
     SENSOR_LABELS = {
-        "s2": "LPC outlet total temp",
-        "s3": "HPC outlet temp",
-        "s4": "LPT coolant temp",
-        "s7": "HPC outlet temp",
-        "s8": "Physical fan speed",
-        "s9": "Physical core speed",
-        "s11": "Static core press",
-        "s12": "Fan exit temp",
-        "s13": "Corrected fan speed",
-        "s14": "Corrected core speed",
-        "s15": "Bypass duct press",
-        "s17": "Engine press ratio",
-        "s20": "HPT coolant flow",
-        "s21": "Coolant bleed flow",
+        "s2": "LPC Outlet Temp.",
+        "s3": "HPC Outlet Temp.",
+        "s4": "LPT Coolant Temp.",
+        "s7": "HPC Outlet Temp. (2)",
+        "s8": "Physical Fan Speed",
+        "s9": "Physical Core Speed",
+        "s11": "Static Core Press.",
+        "s12": "Fan Exit Temp.",
+        "s13": "Corrected Fan Speed",
+        "s14": "Corrected Core Speed",
+        "s15": "Bypass Duct Press.",
+        "s17": "Engine Press. Ratio",
+        "s20": "HPT Coolant Flow",
+        "s21": "Coolant Bleed Flow",
     }
 
     @st.cache_data
@@ -322,24 +371,26 @@ with tab_turbofan:
             top_features=list(top_features_tuple),
         )
 
+    # ---- HEADER ----
     head_l, head_r = st.columns([3, 2])
     with head_l:
         st.markdown(
             '<div class="pm-header-title"><span class="dot"></span>'
             'Predictive Maintenance AI Platform</div>'
-            '<div class="pm-header-sub">Turbofan engine — RUL prediction, explanation, and AI maintenance report</div>',
+            '<div class="pm-header-sub">Turbofan engine health \u2014 estimated remaining life, contributing factors, and maintenance interpretation</div>',
             unsafe_allow_html=True,
         )
     with head_r:
         c1, c2 = st.columns([1, 1])
         with c1:
-            engine_id = st.selectbox("Unit", list(range(1, 101)), index=46, label_visibility="collapsed")
+            engine_id = st.selectbox("Select Engine", list(range(1, 101)), index=46, label_visibility="collapsed")
         with c2:
-            st.button("Generate Report", use_container_width=True)
+            st.button("Generate AI Maintenance Report", use_container_width=True)
 
     st.markdown("---")
 
-    with st.spinner("Loading model (first run ~20s)..."):
+    # ---- LOAD MODEL ----
+    with st.spinner("Loading engine analysis model \u2014 this may take a moment on the first run..."):
         model, explainer = train_model()
         _, test, rul_true = load_data()
 
@@ -354,85 +405,139 @@ with tab_turbofan:
     true_rul = int(rul_true.iloc[engine_id - 1]["RUL"])
 
     ratio = max(0.0, min(1.0, pred / 125.0))
-    if pred > 80:    bar_color = "#4edea3"; status = "OPTIMAL"
-    elif pred > 30:  bar_color = "#ffb95f"; status = "CAUTION"
-    else:            bar_color = "#ffb4ab"; status = "CRITICAL"
+    if pred > 80:    bar_color = "#4edea3"; status = "Healthy"
+    elif pred > 30:  bar_color = "#ffb95f"; status = "Caution"
+    else:            bar_color = "#ffb4ab"; status = "Critical"
 
     left, right = st.columns([5, 7])
 
+    # ---- LEFT COLUMN: METRIC CARDS ----
     with left:
+        # Engine identity card
         st.markdown(f"""
         <div class="pm-card">
           <div style="display:flex;justify-content:space-between;align-items:flex-start;">
             <div>
-              <div class="pm-sub" style="margin:0 0 4px 0;">TURBOFAN UNIT ID / C-MAPSS FD001</div>
+              <div class="pm-sub" style="margin:0 0 4px 0;">Turbofan Engine</div>
               <div style="font-size:26px;font-weight:600;letter-spacing:-0.02em;">Engine {engine_id}</div>
-              <div class="pm-sub" style="margin-top:4px;">CYCLE #{last_cycle}</div>
+              <div class="pm-sub" style="margin-top:4px;">Operating Cycle #{last_cycle}</div>
             </div>
             <span class="pm-health"><span class="dot"></span>OPERATIONAL</span>
           </div>
         </div>
         """, unsafe_allow_html=True)
 
+        # Estimated remaining life card
+        if pred > 80:
+            status_badge_class = "green"
+            status_badge_text = f"Healthy \u2014 above 80 cycles"
+        elif pred > 30:
+            status_badge_class = "amber"
+            status_badge_text = f"Caution \u2014 30 to 80 cycles"
+        else:
+            status_badge_class = "red"
+            status_badge_text = f"Critical \u2014 below 30 cycles"
+
         st.markdown(f"""
         <div class="pm-card">
-          <div class="pm-card-title">Predicted RUL
-            <span class="pm-badge" style="margin-left:auto;">Primary Inferencer</span>
+          <div class="pm-card-title">Estimated Remaining Life
+            <span class="pm-badge {status_badge_class}" style="margin-left:auto;">
+              {status_badge_text}
+            </span>
           </div>
           <div style="display:flex;align-items:baseline;">
             <span class="pm-metric" style="color:{bar_color};">{pred:.0f}</span>
             <span class="pm-unit">cycles</span>
-            <span class="pm-badge {('green' if pred>80 else 'blue')}" style="margin-left:auto;">
-              STATUS: {status} ({'>80' if pred>80 else ('30–80' if pred>30 else '<30')})
-            </span>
           </div>
           <div class="pm-bar">
             <div class="pm-bar-fill" style="width:{ratio*100:.1f}%;background:{bar_color};"></div>
           </div>
           <div class="pm-sub" style="display:flex;justify-content:space-between;">
-            <span>&lt;30 CRIT</span><span>30–80 CAUTION</span><span>&gt;80 NORMAL</span><span>MAX 125</span>
+            <span>Critical (below 30)</span><span>Caution (30\u201380)</span><span>Healthy (above 80)</span>
           </div>
+          <div class="pm-card-explain">Remaining useful life is the estimated number of operating cycles before maintenance is needed. One cycle represents a complete engine start-to-shutdown sequence. The scale ranges from 0 (end of life) to 125 (maximum).</div>
         </div>
         """, unsafe_allow_html=True)
 
+        # Fleet median card
         delta = pred - BASELINE
+        if delta > 0:
+            fleet_badge_class = "green"
+            fleet_badge_text = f"This engine: {abs(delta):.0f} cycles above fleet"
+        elif delta < 0:
+            fleet_badge_class = "amber"
+            fleet_badge_text = f"This engine: {abs(delta):.0f} cycles below fleet"
+        else:
+            fleet_badge_class = "blue"
+            fleet_badge_text = "This engine: at fleet median"
+
         st.markdown(f"""
         <div class="pm-card">
-          <div class="pm-card-title">Population Baseline
-            <span class="pm-badge blue" style="margin-left:auto;">{delta:+.0f} cyc vs fleet</span>
+          <div class="pm-card-title">Fleet Median Remaining Life
+            <span class="pm-badge {fleet_badge_class}" style="margin-left:auto;">{fleet_badge_text}</span>
           </div>
           <div><span class="pm-metric" style="color:#e5e1e4;">{BASELINE:.0f}</span><span class="pm-unit">cycles</span></div>
-          <div class="pm-sub" style="margin-top:6px;">Fleet median across 100 engines</div>
+          <div class="pm-card-explain">The fleet median is a reference value representing the middle predicted remaining life across the benchmark engine fleet. It helps gauge whether this engine is in better or worse condition relative to the fleet.</div>
         </div>
         """, unsafe_allow_html=True)
+
+        # Actual benchmark card
+        prediction_error = pred - true_rul
+        if prediction_error > 0:
+            err_color = "#89ceff"
+            err_label = "(overestimated)"
+        elif prediction_error < 0:
+            err_color = "#ffb95f"
+            err_label = "(underestimated)"
+        else:
+            err_color = "#4edea3"
+            err_label = "(exact match)"
 
         st.markdown(f"""
         <div class="pm-card" style="background:#2a2a2c;">
-          <div class="pm-card-title" style="color:#bec8d2;">True RUL (Answer Key)
+          <div class="pm-card-title" style="color:#bec8d2;">Actual Remaining Life (Benchmark)
             <span class="pm-badge" style="margin-left:auto;">Benchmark</span>
           </div>
           <div><span class="pm-metric muted">{true_rul}</span><span class="pm-unit" style="color:#88929b;">cycles</span></div>
-          <div class="pm-sub">Ground truth from test set</div>
+          <div style="margin-top:8px;">
+            <span style="font-family:'JetBrains Mono',monospace;font-size:13px;color:{err_color};">
+              Prediction Error: {prediction_error:+.0f} cycles {err_label}
+            </span>
+          </div>
+          <div class="pm-card-explain">This is the reference answer from the test dataset, used to evaluate model accuracy. The model did not have access to this value when making its prediction. The prediction error shows how far the estimate was from this benchmark.</div>
         </div>
         """, unsafe_allow_html=True)
 
+    # ---- RIGHT COLUMN: SHAP CHART ----
     with right:
-        st.markdown('<div class="pm-card-title" style="font-size:20px;font-weight:600;">Why this prediction?</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="pm-card-title" style="font-size:20px;font-weight:600;">'
+            'What influenced the estimated remaining life?</div>',
+            unsafe_allow_html=True,
+        )
 
-        names = [f"{p[0].split('_')[0]} ({SENSOR_LABELS.get(p[0].split('_')[0], '')})  [{p[0]}]" for p in pairs][::-1]
+        st.markdown(
+            '<div class="pm-card-explain" style="margin-bottom:12px;">'
+            'Each bar shows how a sensor reading contributed to the model\u2019s estimated remaining life. '
+            'Positive values (blue) increased the estimate, while negative values (pink) decreased it. '
+            'The model identifies patterns in sensor data \u2014 these are correlations, not confirmed causes of wear.</div>',
+            unsafe_allow_html=True,
+        )
+
+        names = [_readable_feature_name(p[0], SENSOR_LABELS) for p in pairs][::-1]
         vals  = [p[1] for p in pairs][::-1]
         colors = ["#0EA5E9" if v > 0 else "#ffb4ab" for v in vals]
 
-        fig, ax = plt.subplots(figsize=(8, 5), facecolor="#1c1b1d")
+        fig, ax = plt.subplots(figsize=(8, 5.5), facecolor="#1c1b1d")
         ax.set_facecolor("#1c1b1d")
         bars = ax.barh(names, vals, color=colors, height=0.62)
         ax.axvline(0, color="#3e4850", linewidth=1.2, linestyle="--")
-        ax.tick_params(colors="#bec8d2", labelsize=9)
+        ax.tick_params(colors="#bec8d2", labelsize=10)
         for spine in ax.spines.values():
             spine.set_visible(False)
         ax.grid(False)
-        ax.set_xlabel("SHAP value (impact on predicted RUL in cycles)",
-                      color="#bec8d2", fontsize=10, labelpad=10)
+        ax.set_xlabel("Contribution to estimated remaining life (in cycles)",
+                      color="#bec8d2", fontsize=11, labelpad=10)
         for bar, v in zip(bars, vals):
             x = bar.get_width()
             ax.text(x + (0.3 if v > 0 else -0.3), bar.get_y() + bar.get_height()/2,
@@ -440,16 +545,27 @@ with tab_turbofan:
                     ha="left" if v > 0 else "right",
                     color="#0EA5E9" if v > 0 else "#ffb4ab",
                     fontsize=9, fontfamily="monospace")
+        fig.subplots_adjust(left=0.42)
         fig.tight_layout()
         st.pyplot(fig, use_container_width=True)
 
-        st.markdown(f'<div class="pm-sub">Base value (population average): {BASELINE:.0f} cycles</div>',
-                    unsafe_allow_html=True)
+        # Legend
+        st.markdown(
+            '<div style="display:flex;gap:24px;justify-content:center;margin-top:8px;">'
+            '<div style="display:flex;align-items:center;gap:6px;font-size:11px;color:#bec8d2;">'
+            '<span style="width:12px;height:12px;background:#0EA5E9;border-radius:3px;display:inline-block;"></span>'
+            'Increased remaining life estimate</div>'
+            '<div style="display:flex;align-items:center;gap:6px;font-size:11px;color:#bec8d2;">'
+            '<span style="width:12px;height:12px;background:#ffb4ab;border-radius:3px;display:inline-block;"></span>'
+            'Decreased remaining life estimate</div></div>',
+            unsafe_allow_html=True,
+        )
 
-    st.markdown("<br>", unsafe_allow_html=True)
+    # ---- MAINTENANCE INTERPRETATION ----
+    st.markdown("", unsafe_allow_html=True)
     top8 = tuple((f, round(float(v), 2)) for f, v in pairs[:8])
 
-    with st.spinner("Asking Gemini..."):
+    with st.spinner("Generating maintenance interpretation..."):
         report = cached_report(
             engine_id=int(engine_id),
             predicted_rul=round(pred, 1),
@@ -460,13 +576,13 @@ with tab_turbofan:
     if isinstance(report, dict):
         verdict        = report.get("verdict", "UNKNOWN")
         urgency        = report.get("urgency", "Routine")
-        summary        = report.get("summary", "—")
-        drivers_pos    = report.get("drivers_positive", "—")
-        drivers_neg    = report.get("drivers_negative", "—")
-        recommendation = report.get("recommendation", "—")
+        summary        = report.get("summary", "\u2014")
+        drivers_pos    = report.get("drivers_positive", "\u2014")
+        drivers_neg    = report.get("drivers_negative", "\u2014")
+        recommendation = report.get("recommendation", "\u2014")
     else:
         verdict, urgency = "UNKNOWN", "Routine"
-        summary, drivers_pos, drivers_neg, recommendation = str(report), "—", "—", "—"
+        summary, drivers_pos, drivers_neg, recommendation = str(report), "\u2014", "\u2014", "\u2014"
 
     verdict_colors = {
         "OPTIMAL":  ("#4edea3", "rgba(78,222,163,0.12)"),
@@ -479,39 +595,43 @@ with tab_turbofan:
     st.markdown(f"""
     <div class="pm-card">
       <div class="pm-card-title" style="font-size:18px;font-weight:600;">
-        AI Maintenance Report
-        <span class="pm-badge green" style="margin-left:8px;">Synthesized</span>
+        Maintenance Interpretation
         <span class="pm-badge" style="margin-left:auto;background:{vbg};color:{vc};">
-          {verdict} · {urgency}
+          {verdict} \u00b7 {urgency}
         </span>
       </div>
+      <div class="pm-section-label">Summary</div>
       <div style="font-size:15px;line-height:1.7;color:#e5e1e4;margin-bottom:18px;">{summary}</div>
+      <div class="pm-section-label">What influenced the prediction</div>
       <div class="pm-sr-grid">
-        <div><div class="pm-sr-label">Pushed RUL up</div><div class="pm-sr-pos">{drivers_pos}</div></div>
-        <div><div class="pm-sr-label">Pushed RUL down</div><div class="pm-sr-neg">{drivers_neg}</div></div>
+        <div><div class="pm-sr-label">Increased the estimate</div><div class="pm-sr-pos">{drivers_pos}</div></div>
+        <div><div class="pm-sr-label">Decreased the estimate</div><div class="pm-sr-neg">{drivers_neg}</div></div>
       </div>
+      <div class="pm-section-label">Recommended next step</div>
       <div class="pm-sr-action">
-        <div class="pm-sr-label" style="margin-bottom:4px;">Recommended action</div>
         <div style="font-size:14px;color:#e5e1e4;">{recommendation}</div>
       </div>
+      <div style="font-size:11px;color:#71717a;margin-top:14px;font-style:italic;">This interpretation is generated by AI based on model outputs. It is advisory only and should not replace professional engineering judgment.</div>
     </div>
     """, unsafe_allow_html=True)
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    st.markdown(f'<div class="pm-provenance">MODEL: XGBoost Regressor · SHAP: TreeExplainer · '
-                f'ANALYZED: {now}</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="pm-provenance">Analyzed: {now} \u00b7 Engine life estimation model \u00b7 Feature contribution analysis</div>',
+        unsafe_allow_html=True,
+    )
 
 
 # ===========================================================================
-# TAB 2 — BEARING (CWRU)
+# TAB 2 \u2014 BEARING (CWRU)
 # ===========================================================================
 with tab_bearing:
     BEARING_FILES = {
-    "Inner race fault":  "1797_IR_7_DE12.npz",
-    "Ball fault":        "1797_B_7_DE12.npz",
-    "Outer race fault":  "1797_OR@6_7_DE12.npz",
-    "Normal baseline":   "1797_Normal.npz",
-}
+        "Inner race fault":  "1797_IR_7_DE12.npz",
+        "Ball fault":        "1797_B_7_DE12.npz",
+        "Outer race fault":  "1797_OR@6_7_DE12.npz",
+        "Normal baseline":   "1797_Normal.npz",
+    }
 
     @st.cache_resource
     def load_bearing_model():
@@ -530,12 +650,13 @@ with tab_bearing:
             top_features=list(top_features_tuple),
         )
 
+    # ---- HEADER ----
     head_l, head_r = st.columns([3, 2])
     with head_l:
         st.markdown(
             '<div class="pm-header-title"><span class="dot"></span>'
             'Predictive Maintenance AI Platform</div>'
-            '<div class="pm-header-sub">Bearing — vibration fault classification, explanation, and AI maintenance report</div>',
+            '<div class="pm-header-sub">Bearing vibration analysis \u2014 fault classification, contributing factors, and maintenance interpretation</div>',
             unsafe_allow_html=True,
         )
     with head_r:
@@ -546,7 +667,7 @@ with tab_bearing:
                 label_visibility="collapsed",
             )
         with c2:
-            st.button("Generate Report", key="bearing_gen", use_container_width=True)
+            st.button("Generate AI Maintenance Report", key="bearing_gen", use_container_width=True)
 
     st.markdown("---")
 
@@ -560,7 +681,7 @@ with tab_bearing:
 
     mat_path = os.path.join(cwru.CWRU_DIR, BEARING_FILES[bearing_label])
 
-    with st.spinner("Analysing vibration signal…"):
+    with st.spinner("Analyzing vibration signal..."):
         result = cwru.predict_file(model_b, feature_names_b, mat_path)
 
     majority_idx   = result["majority_class"]
@@ -591,18 +712,18 @@ with tab_bearing:
 
     left, right = st.columns([5, 7])
 
-    # ---- LEFT ----
+    # ---- LEFT COLUMN ----
     with left:
-        # Bearing header card
+        # Bearing identity card
         st.markdown(f"""
         <div class="pm-card">
           <div style="display:flex;justify-content:space-between;align-items:flex-start;">
             <div>
-              <div class="pm-sub" style="margin:0 0 4px 0;">BEARING UNIT / CWRU 12k DRIVE-END</div>
+              <div class="pm-sub" style="margin:0 0 4px 0;">Bearing Vibration Signal</div>
               <div style="font-size:26px;font-weight:600;letter-spacing:-0.02em;">
                 {bearing_label.split('(')[0].strip()}
               </div>
-              <div class="pm-sub" style="margin-top:4px;">{result['n_windows']} WINDOWS ANALYSED</div>
+              <div class="pm-sub" style="margin-top:4px;">{result['n_windows']} signal segments analyzed</div>
             </div>
             <span class="pm-health"
                   style="background:{'rgba(78,222,163,0.12)' if status_b=='OPTIMAL' else ('rgba(255,185,95,0.12)' if status_b=='CAUTION' else 'rgba(255,180,171,0.12)')};
@@ -613,14 +734,13 @@ with tab_bearing:
         </div>
         """, unsafe_allow_html=True)
 
-        # Predicted condition card
+        # Detected bearing condition card
         st.markdown(f"""
         <div class="pm-card">
           <div class="pm-card-title">
             <span style="display:inline-flex;align-items:center;gap:6px;">
-              <span style="color:{bar_color_b};">◉</span> Predicted condition
+              <span style="color:{bar_color_b};">\u25c9</span> Detected Bearing Condition
             </span>
-            <span class="pm-badge" style="margin-left:auto;">Classifier</span>
           </div>
           <div style="font-family:'JetBrains Mono',monospace;font-size:24px;font-weight:600;
                       letter-spacing:-0.02em;color:{bar_color_b};margin-bottom:8px;">
@@ -629,71 +749,104 @@ with tab_bearing:
           <div class="pm-bar">
             <div class="pm-bar-fill" style="width:{confidence*100:.1f}%;background:{bar_color_b};"></div>
           </div>
-          <div class="pm-sub">Confidence: {confidence:.1%} &nbsp; (avg across {result['n_windows']} windows)</div>
+          <div class="pm-sub">Model Confidence: {confidence:.1%} &nbsp; (avg across {result['n_windows']} segments)</div>
+          <div class="pm-card-explain">The model analyzed vibration patterns to classify the bearing into one of four conditions. Model confidence indicates how consistently the model identified this condition across all signal segments. This is not a guaranteed probability of real-world failure.</div>
         </div>
         """, unsafe_allow_html=True)
 
-        # Class probabilities card
-        rows_html = ""
-        for i, (name, p) in enumerate(zip(class_names_b, mean_proba)):
-            border = "" if i == len(class_names_b) - 1 else "border-bottom:1px solid #2a2a2c;"
-            rows_html += (
-                f'<div style="display:flex;justify-content:space-between;'
-                f'padding:8px 0;{border}">'
-                f'<span style="color:#bec8d2;font-size:13px;">{name}</span>'
-                f'<span style="font-family:\'JetBrains Mono\',monospace;'
-                f'color:#e5e1e4;font-weight:500;">{p:.1%}</span></div>'
+        # Condition meanings expander
+        with st.expander("What do these conditions mean?"):
+            st.markdown("""
+- **Normal** \u2014 No detectable fault in the bearing. Vibration patterns are within expected ranges.
+- **Inner Race Fault** \u2014 A defect on the inner ring of the bearing. Often caused by fatigue, contamination, or improper lubrication.
+- **Ball Fault** \u2014 A defect on one or more rolling elements (balls). May indicate early-stage wear or material fatigue.
+- **Outer Race Fault** \u2014 A defect on the outer ring of the bearing. One of the most common bearing failure modes.
+            """)
+
+        # Model scores bar chart (replaces plain text probabilities)
+        st.markdown("""
+        <div class="pm-card-title" style="margin-top:16px;margin-bottom:8px;">
+          <span style="display:inline-flex;align-items:center;gap:6px;">
+            <span style="color:#88929b;">\u25a4</span> Model Scores for Each Condition
+          </span>
+        </div>
+        """, unsafe_allow_html=True)
+
+        fig_prob, ax_prob = plt.subplots(figsize=(5, 2.5), facecolor="#1c1b1d")
+        ax_prob.set_facecolor("#1c1b1d")
+        prob_colors = []
+        for i, name in enumerate(class_names_b):
+            if name == predicted_name:
+                prob_colors.append(bar_color_b)
+            else:
+                prob_colors.append("#3e4850")
+        y_positions = list(range(len(class_names_b)))
+        prob_vals = [p * 100 for p in mean_proba]
+        bars_prob = ax_prob.barh(y_positions, prob_vals, color=prob_colors, height=0.55)
+        ax_prob.set_yticks(y_positions)
+        ax_prob.set_yticklabels(class_names_b)
+        ax_prob.tick_params(colors="#bec8d2", labelsize=10)
+        ax_prob.set_xlabel("Score (%)", color="#bec8d2", fontsize=10, labelpad=8)
+        ax_prob.set_xlim(0, 105)
+        for spine in ax_prob.spines.values():
+            spine.set_visible(False)
+        ax_prob.grid(False)
+        for bar_p, pv in zip(bars_prob, prob_vals):
+            ax_prob.text(
+                bar_p.get_width() + 1.5,
+                bar_p.get_y() + bar_p.get_height() / 2,
+                f"{pv:.1f}%",
+                va="center", ha="left",
+                color="#e5e1e4", fontsize=9, fontfamily="monospace",
             )
-        st.markdown(f"""
-        <div class="pm-card">
-          <div class="pm-card-title">
-            <span style="display:inline-flex;align-items:center;gap:6px;">
-              <span style="color:#88929b;">▤</span> Class probabilities
-            </span>
-          </div>
-          {rows_html}
-        </div>
-        """, unsafe_allow_html=True)
+        fig_prob.tight_layout()
+        st.pyplot(fig_prob, use_container_width=True)
 
-    # ---- RIGHT ----
-    with right:
         st.markdown(
-            '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">'
-            '<div class="pm-card-title" style="font-size:20px;font-weight:600;margin:0;">'
-            'Why this prediction?</div>'
-            '<span class="pm-badge blue">TreeSHAP Local Attribution</span>'
-            '</div>',
+            '<div class="pm-card-explain">These scores show the model\u2019s confidence for each bearing '
+            'condition. The highest score determines the detected condition. '
+            'Scores across all conditions sum to 100%.</div>',
             unsafe_allow_html=True,
         )
 
+    # ---- RIGHT COLUMN: SHAP CHART ----
+    with right:
+        st.markdown(
+            '<div class="pm-card-title" style="font-size:20px;font-weight:600;margin-bottom:4px;">'
+            'Which vibration patterns influenced the result?</div>',
+            unsafe_allow_html=True,
+        )
+
+        # Legend
         st.markdown(
             '<div style="display:flex;gap:24px;padding:8px 12px;background:#1c1b1d;'
             'border-radius:6px;margin-bottom:10px;">'
             '<div style="display:flex;align-items:center;gap:8px;font-size:11px;color:#bec8d2;">'
             '<span style="width:12px;height:12px;background:#ffb4ab;border-radius:3px;"></span>'
-            'Negative impact <span style="color:#ffb4ab;">(Opposes class)</span></div>'
+            'Argued against this condition</div>'
             '<div style="display:flex;align-items:center;gap:8px;font-size:11px;color:#bec8d2;">'
             '<span style="width:12px;height:12px;background:#0EA5E9;border-radius:3px;"></span>'
-            f'Positive impact <span style="color:#0EA5E9;">(Pushes toward {predicted_name})</span></div>'
+            f'Supported the {predicted_name} classification</div>'
             '</div>',
             unsafe_allow_html=True,
         )
 
-        names = [p[0] for p in pairs_b][::-1]
+        raw_names = [p[0] for p in pairs_b][::-1]
+        readable_names = [f"{BEARING_FEATURE_LABELS.get(n, n)}  [{n}]" for n in raw_names]
         vals  = [float(p[1]) for p in pairs_b][::-1]
         colors = ["#0EA5E9" if v > 0 else "#ffb4ab" for v in vals]
 
         fig, ax = plt.subplots(figsize=(8, 5.2), facecolor="#1c1b1d")
         ax.set_facecolor("#1c1b1d")
-        bars = ax.barh(names, vals, color=colors, height=0.62)
+        bars = ax.barh(readable_names, vals, color=colors, height=0.62)
         ax.axvline(0, color="#88929b", linewidth=1.0, linestyle=(0, (3, 3)))
         ax.tick_params(colors="#bec8d2", labelsize=10)
         for spine in ax.spines.values():
             spine.set_visible(False)
         ax.grid(False)
         ax.set_xlabel(
-            f"SHAP value (impact on {predicted_name} probability)",
-            color="#bec8d2", fontsize=10, labelpad=10,
+            f"Contribution to {predicted_name} classification",
+            color="#bec8d2", fontsize=11, labelpad=10,
         )
         for bar, v in zip(bars, vals):
             x = bar.get_width()
@@ -707,21 +860,35 @@ with tab_bearing:
                 fontsize=9,
                 fontfamily="monospace",
             )
+        fig.subplots_adjust(left=0.42)
         fig.tight_layout()
         st.pyplot(fig, use_container_width=True)
 
         st.markdown(
-            '<div style="text-align:center;font-size:11px;color:#88929b;'
-            'text-transform:uppercase;letter-spacing:0.06em;margin-top:6px;">'
-            'Vibration features · time-domain statistics + FFT band energies</div>',
+            '<div class="pm-card-explain" style="text-align:center;">'
+            'This chart identifies which vibration patterns the model used for classification. '
+            'These are statistical patterns in the data, not confirmed causes of bearing damage. '
+            'Positive contributions supported the detected condition, while negative contributions suggested other conditions.</div>',
             unsafe_allow_html=True,
         )
 
-    # ---- AI REPORT ----
-    st.markdown("<br>", unsafe_allow_html=True)
+        # Expandable glossary
+        with st.expander("Understanding vibration features"):
+            st.markdown("""
+**Signal Intensity (RMS)** \u2014 Root Mean Square: the overall energy level of the vibration signal. Higher values often indicate more severe vibration.
+
+**Sharpness of Vibration Spikes (Kurtosis)** \u2014 Measures how "peaky" the signal is. High kurtosis suggests sharp, impulsive vibrations typical of bearing defects.
+
+**Frequency Band Energy** \u2014 The vibration signal is split into frequency ranges. Different fault types tend to concentrate energy in specific bands.
+
+**Spectral Center of Mass** \u2014 The "average" frequency weighted by energy. Shifts in this value can indicate changes in the vibration pattern.
+            """)
+
+    # ---- MAINTENANCE INTERPRETATION ----
+    st.markdown("", unsafe_allow_html=True)
     top8_b = tuple((f, round(float(v), 4)) for f, v in pairs_b[:8])
 
-    with st.spinner("Asking Gemini..."):
+    with st.spinner("Generating maintenance interpretation..."):
         report_b = cached_bearing_report(
             bearing_id=bearing_label,
             predicted_class=predicted_name,
@@ -732,46 +899,47 @@ with tab_bearing:
     if isinstance(report_b, dict):
         v_b = report_b.get("verdict", "UNKNOWN")
         u_b = report_b.get("urgency", "Routine")
-        s_b = report_b.get("summary", "—")
-        dp_b = report_b.get("drivers_positive", "—")
-        dn_b = report_b.get("drivers_negative", "—")
-        r_b = report_b.get("recommendation", "—")
+        s_b = report_b.get("summary", "\u2014")
+        dp_b = report_b.get("drivers_positive", "\u2014")
+        dn_b = report_b.get("drivers_negative", "\u2014")
+        r_b = report_b.get("recommendation", "\u2014")
     else:
         v_b, u_b = "UNKNOWN", "Routine"
-        s_b, dp_b, dn_b, r_b = str(report_b), "—", "—", "—"
+        s_b, dp_b, dn_b, r_b = str(report_b), "\u2014", "\u2014", "\u2014"
 
     vc_b, vbg_b = verdict_colors.get(v_b, verdict_colors["UNKNOWN"])
 
     st.markdown(f"""
     <div class="pm-card">
       <div class="pm-card-title" style="font-size:18px;font-weight:600;">
-        AI Maintenance Report
-        <span class="pm-badge green" style="margin-left:8px;">Synthesized</span>
+        Maintenance Interpretation
         <span class="pm-badge" style="margin-left:auto;background:{vbg_b};color:{vc_b};">
-          {v_b} · {u_b}
+          {v_b} \u00b7 {u_b}
         </span>
       </div>
+      <div class="pm-section-label">Summary</div>
       <div style="font-size:15px;line-height:1.7;color:#e5e1e4;margin-bottom:18px;">{s_b}</div>
+      <div class="pm-section-label">What influenced the classification</div>
       <div class="pm-sr-grid">
         <div>
-          <div class="pm-sr-label">Pushed toward {predicted_name}</div>
+          <div class="pm-sr-label">Supported this classification</div>
           <div class="pm-sr-pos">{dp_b}</div>
         </div>
         <div>
-          <div class="pm-sr-label">Opposing signals</div>
+          <div class="pm-sr-label">Argued against this classification</div>
           <div class="pm-sr-neg">{dn_b}</div>
         </div>
       </div>
+      <div class="pm-section-label">Recommended next step</div>
       <div class="pm-sr-action">
-        <div class="pm-sr-label" style="margin-bottom:4px;">Recommended action</div>
         <div style="font-size:14px;color:#e5e1e4;">{r_b}</div>
       </div>
+      <div style="font-size:11px;color:#71717a;margin-top:14px;font-style:italic;">This interpretation is generated by AI based on model outputs. It is advisory only and should not replace professional engineering judgment.</div>
     </div>
     """, unsafe_allow_html=True)
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     st.markdown(
-        f'<div class="pm-provenance">MODEL: XGBoost Classifier · SHAP: TreeExplainer · '
-        f'ANALYZED: {now}</div>',
+        f'<div class="pm-provenance">Analyzed: {now} \u00b7 Bearing classification model \u00b7 Feature contribution analysis</div>',
         unsafe_allow_html=True,
     )

@@ -32,42 +32,44 @@ client = genai.Client(api_key=API_KEY)
 
 
 # ---------------------------------------------------------------------------
-# Prompt
+# Prompt — Turbofan engine remaining life interpretation
 # ---------------------------------------------------------------------------
-PROMPT_TEMPLATE = """You are a maintenance engineer assistant for a turbofan engine monitoring system.
+PROMPT_TEMPLATE = """You are a maintenance engineer assistant writing a brief maintenance interpretation for a turbofan engine monitoring system.
 
-The AI model has analysed the sensor data from one engine and produced the following output:
+The predictive model has analysed sensor data from one engine and produced the following output:
 
 PREDICTION
 - Engine ID: {engine_id}
-- Predicted Remaining Useful Life (RUL): {predicted_rul:.0f} cycles
-- Population-average RUL for reference: {baseline:.0f} cycles
+- Estimated remaining useful life: {predicted_rul:.0f} operating cycles
+- Fleet median remaining life for reference: {baseline:.0f} operating cycles
 
-WHY THE MODEL PREDICTED THIS
-The following sensor features pushed the prediction UP (model thinks the engine has MORE life left):
+WHAT INFLUENCED THE PREDICTION
+The following sensor readings increased the remaining life estimate (the model considers the engine healthier based on these):
 {positive_drivers}
 
-The following sensor features pushed the prediction DOWN (model thinks the engine has LESS life left):
+The following sensor readings decreased the remaining life estimate (the model considers the engine more worn based on these):
 {negative_drivers}
 
 Return ONLY a JSON object (no markdown fences, no prose before or after) with exactly these keys:
 
 {{
   "verdict": "<one of: OPTIMAL, CAUTION, CRITICAL>",
-  "summary": "<2-3 sentences. Plain English. Mention the predicted RUL in cycles. Say whether it's above or below the fleet average.>",
-  "drivers_positive": "<1 sentence naming the sensors that pushed RUL up. Use plain descriptions, not 'SHAP'.>",
-  "drivers_negative": "<1 sentence naming the sensors that pushed RUL down.>",
-  "recommendation": "<ONE full sentence (10-25 words). Start with an action verb. State what to do AND on what component. Example: 'Schedule a bearing inspection within the next maintenance window to verify raceway condition.' Do NOT return a single word.>",,
+  "summary": "<2-3 sentences in plain English. Mention the estimated remaining life in operating cycles. Say whether it is above or below the fleet median. Write as an interpretation, not a certainty — use phrases like 'the model estimates' or 'the analysis suggests'. Do not claim the engine has definitely failed.>",
+  "drivers_positive": "<1 sentence naming the sensor readings that increased the remaining life estimate. Use plain sensor descriptions. Do not use abbreviations like RUL, SHAP, FFT, or model names.>",
+  "drivers_negative": "<1 sentence naming the sensor readings that decreased the remaining life estimate. Use plain sensor descriptions. If none, write 'No significant factors decreased the estimate.'>",
+  "recommendation": "<ONE full sentence (10-25 words). Start with an action verb. State what to do AND on what component. Frame as advisory — use 'consider', 'schedule', or 'monitor'. Do NOT claim failure has occurred. Example: 'Consider scheduling a compressor inspection within the next maintenance window to verify component condition.'>",
   "urgency": "<one of: Routine, Elevated, Immediate>"
 }}
 
 Rules:
-- Do not mention SHAP, XGBoost, LSTM, or any technical model detail.
+- Do not mention SHAP, TreeSHAP, XGBoost, LSTM, FFT, or any technical model names or methods.
+- Do not use the abbreviation "RUL" — always write "remaining life" or "remaining useful life" in full.
 - Do not invent sensor names or values not given above.
-- If the predicted RUL is below 30, verdict MUST be CRITICAL and urgency MUST be Immediate.
-- If the predicted RUL is between 30 and 80, verdict MUST be CAUTION.
-- If the predicted RUL is above 80, verdict MUST be OPTIMAL.
+- If the estimated remaining life is below 30, verdict MUST be CRITICAL and urgency MUST be Immediate.
+- If the estimated remaining life is between 30 and 80, verdict MUST be CAUTION.
+- If the estimated remaining life is above 80, verdict MUST be OPTIMAL.
 - Every field MUST be a complete sentence or phrase. Never a single word.
+- Treat all predictions as estimates, not certainties. Recommendations are advisory.
 - Return valid JSON only. No trailing commas. No markdown.
 """
 
@@ -94,9 +96,9 @@ def _fallback(reason: str) -> dict:
     return {
         "verdict": "UNKNOWN",
         "summary": (
-            f"AI report temporarily unavailable ({reason}). "
-            "The prediction and SHAP explanation above are still valid — "
-            "only the natural-language summary failed. Try again in a minute."
+            f"AI interpretation temporarily unavailable ({reason}). "
+            "The prediction and feature contribution chart above are still valid — "
+            "only the written interpretation could not be generated. Try again in a minute."
         ),
         "drivers_positive": "—",
         "drivers_negative": "—",
@@ -211,36 +213,37 @@ if __name__ == "__main__":
     print(json.dumps(report, indent=2))
 
 
-    # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Bearing fault classification report
 # ---------------------------------------------------------------------------
-CLASSIFICATION_PROMPT = """You are a maintenance engineer assistant for a bearing monitoring system.
+CLASSIFICATION_PROMPT = """You are a maintenance engineer assistant writing a brief maintenance interpretation for a bearing monitoring system.
 
-The AI model analysed vibration data from one bearing and produced:
+The predictive model analysed vibration data from one bearing and produced:
 
 PREDICTION
-- Bearing ID: {bearing_id}
-- Predicted condition: {predicted_class}
-- Confidence: {confidence:.0%}
+- Bearing signal: {bearing_id}
+- Detected condition: {predicted_class}
+- Model confidence: {confidence:.0%}
 
-WHY THE MODEL PREDICTED THIS
-Top vibration features driving the prediction (signed SHAP contributions):
+WHAT INFLUENCED THE CLASSIFICATION
+Top vibration pattern contributions that supported or opposed the detected condition:
 {drivers}
 
 Return ONLY a JSON object (no markdown fences, no prose) with exactly these keys:
 
 {{
   "verdict": "<one of: OPTIMAL, CAUTION, CRITICAL>",
-  "summary": "<2-3 sentences. Plain English. State the fault type and confidence.>",
-  "drivers_positive": "<1 sentence naming the features that most supported the prediction.>",
-  "drivers_negative": "<1 sentence naming features that argued against it. If none, write 'No significant opposing signals.'>",
-  "recommendation": "<one concrete action: monitor / inspect / replace / schedule.>",
+  "summary": "<2-3 sentences in plain English. State the detected condition and model confidence. Write as an interpretation — use phrases like 'the analysis suggests' or 'the model detected'. Do not claim the bearing has definitely failed.>",
+  "drivers_positive": "<1 sentence naming the vibration patterns that most supported the detected condition. Use plain descriptions, not technical abbreviations.>",
+  "drivers_negative": "<1 sentence naming vibration patterns that argued against it. If none, write 'No significant opposing patterns were detected.'>",
+  "recommendation": "<ONE full sentence (10-25 words). Start with an action verb. Frame as advisory. Example: 'Consider scheduling a bearing inspection to verify the detected condition and assess replacement needs.'>",
   "urgency": "<one of: Routine, Elevated, Immediate>"
 }}
 
 Rules:
 - 'Normal' -> OPTIMAL. 'Ball' or 'Outer Race' -> CRITICAL. 'Inner Race' -> CAUTION (or CRITICAL if confidence > 90%).
-- Do not mention SHAP, XGBoost, or any technical model detail.
+- Do not mention SHAP, TreeSHAP, XGBoost, FFT, or any technical model names or methods.
+- Treat predictions as estimates, not certainties. Recommendations are advisory only.
 - Return valid JSON only. No trailing commas. No markdown.
 """
 
